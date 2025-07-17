@@ -288,3 +288,119 @@ class GraphConvertor:
             raise NotImplementedError(
                 "model type {} not implemented".format(self.model_type)
             )
+
+class ChemGraphBatchConvertor:
+    def __init__(self, twobody_cutoff=5.0, threebody_cutoff=4.0, pbc=True):
+        self.twobody_cutoff = twobody_cutoff
+        self.threebody_cutoff = threebody_cutoff
+        self.pbc = pbc
+
+    def get_pbc_offsets(self, diff, cell):
+        inv_cell = torch.inverse(cell)
+        frac_diff = torch.matmul(diff, inv_cell)
+        frac_diff -= torch.round(frac_diff)
+        cart_diff = torch.matmul(frac_diff, cell)
+        return cart_diff, frac_diff
+
+    def build_neighbor_graph(self, pos, cell, cutoff):
+        num_atoms = pos.shape[0]
+        edge_src, edge_dst, pbc_offsets = [], [], []
+        for i in range(num_atoms):
+            for j in range(num_atoms):
+                if i == j:
+                    continue
+                dR = pos[j] - pos[i]
+                cart_diff, frac_offset = self.get_pbc_offsets(dR.unsqueeze(0), cell)
+                dR_pbc = cart_diff[0]
+                dist = torch.norm(dR_pbc)
+                if dist < cutoff:
+                    edge_src.append(i)
+                    edge_dst.append(j)
+                    pbc_offsets.append(frac_offset[0])
+        if len(edge_src) == 0:
+            # Avoid empty edge case
+            edge_src = edge_dst = pbc_offsets = [0]
+        return (
+            torch.tensor([edge_src, edge_dst], dtype=torch.long),
+            torch.stack(pbc_offsets, dim=0),
+        )
+
+    def build_three_body_indices(self, edge_index):
+        src, dst = edge_index
+        num_edges = src.shape[0]
+        edge_dict = {}
+        for idx, (i, j) in enumerate(zip(src, dst)):
+            edge_dict.setdefault(i.item(), []).append((j.item(), idx))
+        three_body_indices = []
+        num_triple_ij = torch.zeros(num_edges, dtype=torch.long)
+        for idx_ij, (i, j) in enumerate(zip(src, dst)):
+            k_list = [k for k, idx_ik in edge_dict[i.item()] if k != j.item()]
+            for k in k_list:
+                idx_ik = next(idx for k2, idx in edge_dict[i.item()] if k2 == k)
+                three_body_indices.append([idx_ij, idx_ik])
+                num_triple_ij[idx_ij] += 1
+        if len(three_body_indices) == 0:
+            three_body_indices = torch.zeros((0, 2), dtype=torch.long)
+            num_three_body = torch.tensor([0], dtype=torch.long)
+        else:
+            three_body_indices = torch.tensor(three_body_indices, dtype=torch.long)
+            num_three_body = torch.tensor([three_body_indices.shape[0]], dtype=torch.long)
+        return three_body_indices, num_three_body, num_triple_ij
+
+    def convert(self, chemgraph):
+        # Unpack batched info
+        num_graphs = len(chemgraph.num_atoms)
+        args = {
+            "atom_attr": [],
+            "atom_pos": [],
+            "cell": [],
+            "edge_index": [],
+            "pbc_offsets": [],
+            "three_body_indices": [],
+            "num_three_body": [],
+            "num_bonds": [],
+            "num_triple_ij": [],
+            "num_atoms": [],
+            "batch": [],
+        }
+        atom_offset = 0
+        edge_offset = 0
+        total_atoms = chemgraph.atomic_numbers.shape[0]
+        for graph_idx in range(num_graphs):
+            n_atoms = chemgraph.num_atoms[graph_idx]
+            sl = slice(atom_offset, atom_offset + n_atoms)
+            atomic_numbers = chemgraph.atomic_numbers[sl]
+            pos = chemgraph.pos[sl]
+            cell = chemgraph.cell[graph_idx]
+            # build graph for this structure
+            edge_index, pbc_offsets = self.build_neighbor_graph(pos, cell, self.twobody_cutoff)
+            num_bonds = edge_index.shape[1]
+            three_body_indices, num_three_body, num_triple_ij = self.build_three_body_indices(edge_index)
+            # adjust edge_index for batching
+            edge_index_batched = edge_index + atom_offset
+            # three_body_indices: adjust to global edge indices
+            if three_body_indices.shape[0] > 0:
+                three_body_indices_batched = three_body_indices + edge_offset
+            else:
+                three_body_indices_batched = three_body_indices
+            # accumulate
+            args["atom_attr"].append(atomic_numbers.unsqueeze(-1).float())
+            args["atom_pos"].append(pos.float())
+            args["cell"].append(cell.unsqueeze(0).float())
+            args["edge_index"].append(edge_index_batched)
+            args["pbc_offsets"].append(pbc_offsets.float())
+            args["three_body_indices"].append(three_body_indices_batched)
+            args["num_three_body"].append(num_three_body)
+            args["num_bonds"].append(torch.tensor([num_bonds], dtype=torch.long))
+            args["num_triple_ij"].append(num_triple_ij)
+            args["num_atoms"].append(torch.tensor([n_atoms], dtype=torch.long))
+            args["batch"].append(torch.full((n_atoms,), graph_idx, dtype=torch.long, device=chemgraph.pos.device))
+            # offsets for next graph
+            atom_offset += n_atoms
+            edge_offset += num_bonds
+        # concatenate all graphs
+        args = {k: torch.cat(v, dim=0) if k not in ["cell", "num_bonds", "num_atoms", "num_three_body"] else torch.cat(v)
+                for k, v in args.items()}
+        args["cell"] = torch.cat(args["cell"], dim=0)  # [num_graphs, 3, 3]
+        args["num_graphs"] = num_graphs
+        return args
